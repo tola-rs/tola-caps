@@ -1,0 +1,16 @@
+[package]
+name = "tola-caps-macros"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Procedural macros for tola-caps capability system"
+repository = "https://github.com/tola-rs/tola-caps"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing", "extra-traits", "derive"] }
+blake3 = "1"
