@@ -1,7 +1,7 @@
 #![allow(dead_code, unused)]
 
 use tola_caps::prelude::*;
-use tola_caps::without;
+use tola_caps::{with, without};
 use std::marker::PhantomData;
 
 #[derive(Capability)]
@@ -65,9 +65,17 @@ pub struct Data<C>(PhantomData<C>);
 #[caps_bound(requires = PublicCap)]
 impl<C> Data<C> {
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<C> Default for Data<C> {
+    fn default() -> Self {
         Self(PhantomData)
     }
+}
 
+impl<C> Data<C> {
     pub fn method(&self) {}
 }
 

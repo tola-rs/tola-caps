@@ -24,7 +24,3 @@ fn test_explicit_target_compiles() {
     // Should compile because C2 has CapB.
     target_c2(w1, w2);
 }
-
-// Ensure it enforces the bound on C2
-// Uncommenting specific line should fail if we tested compile_fail,
-// but here we just ensure correct compilation of the constraint.

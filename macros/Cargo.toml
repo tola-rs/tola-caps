@@ -1,6 +1,6 @@
 [package]
 name = "tola-caps-macros"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Procedural macros for tola-caps capability system"
@@ -13,4 +13,3 @@ proc-macro = true
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing", "extra-traits", "derive"] }
-blake3 = "1"

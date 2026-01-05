@@ -1,0 +1,30 @@
+use tola_caps::prelude::*;
+use tola_caps::AutoCaps;
+use std::marker::PhantomData;
+
+#[derive(Clone, Copy, AutoCaps)]
+struct Wrapper<T: ?Sized>(PhantomData<T>);
+
+#[derive(Clone, Copy, AutoCaps)]
+struct BoundedWrapper<T: Clone>(T);
+
+// NOTE: This test is expected to FAIL on Stable Rust due to "generic parameters may not be used in const operations".
+// But we generate the code unconditionally as requested by user.
+
+fn main() {
+    println!("Running generic_test example...");
+
+    // 1. Wrapper<i32> (Clone)
+    assert!(!<Wrapper<i32> as AutoCaps>::IS_CLONE, "Stable limitation: IS_CLONE should be false for unbound generic");
+    println!("Wrapper<i32> IS_CLONE: {}", <Wrapper<i32> as AutoCaps>::IS_CLONE);
+
+    // 2. Check AutoCapSet generation
+    // This function requires T to implement AutoCapSet.
+    // If the macro generates the impl, this is valid usage (even if impl body implies errors).
+    fn check_set<T: AutoCapSet>(_: T) {}
+
+    // Uncommenting this triggers the "generic const expr" error on Stable.
+    // check_set(Wrapper::<i32>(PhantomData));
+
+    println!("AutoCapSet impl generated (but usage may require Nightly)!");
+}

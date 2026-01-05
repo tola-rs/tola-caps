@@ -1,1093 +1,734 @@
 //! Procedural macros for tola-caps capability system
 //!
-//! Provides:
-//! - `#[derive(Capability)]` - auto-generate hash stream from type name
-//! - `#[requires]` - require capabilities with boolean logic
-//! - `#[conflicts]` - require capabilities to be absent
-//! - `caps!` - build capability sets with duplicate checking
+//! # Unified Macro API
+//!
+//! ## Core Macros (Recommended)
+//!
+//! | Macro | Target | Purpose |
+//! |-------|--------|---------|
+//! | `#[cap]` | trait | Register trait for caps system |
+//! | `#[cap]` | struct/enum | Auto-detect std traits |
+//! | `#[specialize]` | impl | Attribute-style specialization |
+//! | `specialization!{}` | - | Block-style specialization |
+//! | `caps![]` | - | Build capability set type |
+//!
+//! ## Example
+//!
+//! ```ignore
+//! // 1. Define a trait with caps support
+//! #[cap]
+//! trait Serializable {
+//!     fn serialize(&self) -> Vec<u8>;
+//! }
+//!
+//! // 2. Use in specialization
+//! specialization! {
+//!     impl<T> Format for T {
+//!         default fn format(&self) -> &'static str { "unknown" }
+//!     }
+//!     impl<T: Serializable> Format for T {
+//!         fn format(&self) -> &'static str { "serializable" }
+//!     }
+//! }
+//!
+//! // 3. Check at compile time
+//! if is_serializable::<MyType>() { ... }
+//! ```
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
-use blake3;
-use syn::{
-    parse::{Parse, ParseStream},
-    parse_macro_input,
-    punctuated::Punctuated,
-    DeriveInput, Ident, ItemFn, LitStr, Token, Type,
-};
+use syn::parse_macro_input;
 
 // =============================================================================
-// #[requires] attribute macro
+// Module Declarations (Three-tier: inner / common / user)
 // =============================================================================
 
-/// Parsed form of `#[requires(C: Cap1, Cap2<T>, ...)]`
-struct RequiresAttr {
-    /// The type parameter name (e.g., `C`)
-    target: Ident,
-    /// The capability types
-    caps: Punctuated<Type, Token![,]>,
-}
+mod inner;
+mod common;
+mod user;
 
-impl Parse for RequiresAttr {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let target: Ident = input.parse()?;
-        let _colon: Token![:] = input.parse()?;
-        let caps = Punctuated::parse_terminated(input)?;
-        Ok(RequiresAttr { target, caps })
-    }
-}
+// =============================================================================
+// Internal Macros (inner/)
+// =============================================================================
 
-/// Attribute macro to add capability requirements to a function.
+/// Generate Peano number type aliases D0..Dn.
 ///
 /// # Usage
-///
 /// ```ignore
-/// #[requires(C: LinksCheckedCap, SvgOptimizedCap)]
-/// fn my_transform<C>(doc: Doc<Indexed, C>) { ... }
+/// peano!(64);  // Generates D0 = Z, D1 = S<D0>, ..., D64 = S<D63>
 /// ```
-///
-/// # How It Works
-///
-/// The macro generates bounds using the `Evaluate` trait:
-/// - Single cap: `C: Evaluate<Has<Cap>, Out = True>`
-/// - Multiple caps: `C: Evaluate<all![Has<A>, Has<B>], Out = True>`
-///
-/// All capabilities listed are required (AND semantics).
-#[deprecated(since = "0.2.0", note = "Use `#[caps(requires = ...)]` instead")]
-#[proc_macro_attribute]
-pub fn requires(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attr = parse_macro_input!(attr as RequiresAttr);
-    let func = parse_macro_input!(item as ItemFn);
-
-    let type_param_ident = &attr.target;
-    let caps: Vec<&Type> = attr.caps.iter().collect();
-
-    if caps.is_empty() {
-        return func.into_token_stream().into();
-    }
-
-    let func_name = &func.sig.ident;
-    let func_vis = &func.vis;
-    let func_inputs = &func.sig.inputs;
-    let func_output = &func.sig.output;
-    let func_generics = &func.sig.generics;
-    let func_body = &func.block;
-    let func_attrs = &func.attrs;
-
-    let generic_params = &func_generics.params;
-    let where_clause = &func_generics.where_clause;
-
-    // Build the Evaluate bound
-    let eval_bound = if caps.len() == 1 {
-        let cap = caps[0];
-        quote! {
-            ::tola_caps::Evaluate<::tola_caps::Has<#cap>, Out = ::tola_caps::Present>
-        }
-    } else {
-        // Multiple caps: use All<HList>
-        let has_caps = caps.iter().map(|cap| {
-            quote! { ::tola_caps::Has<#cap> }
-        });
-        quote! {
-            ::tola_caps::Evaluate<
-                ::tola_caps::All<::tola_caps::hlist![#(#has_caps),*]>,
-                Out = ::tola_caps::Present
-            >
-        }
-    };
-
-    // Build the where clause
-    let new_where = if let Some(wc) = where_clause {
-        let existing_predicates = &wc.predicates;
-        quote! {
-            where #existing_predicates, #type_param_ident: #eval_bound
-        }
-    } else {
-        quote! {
-            where #type_param_ident: #eval_bound
-        }
-    };
-
-    let output = quote! {
-        #(#func_attrs)*
-        #func_vis fn #func_name<#generic_params>(#func_inputs) #func_output #new_where
-        #func_body
-    };
-
-    output.into()
+#[proc_macro]
+pub fn peano(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as inner::peano::PeanoInput);
+    inner::peano::expand_peano(input).into()
 }
 
-/// Attribute macro to require capabilities to be ABSENT.
+/// Generate HashStream impl for ByteStream128.
 ///
-/// Use this to enforce that a transform runs BEFORE certain capabilities are added.
+/// ByteStream128 stores 64 nibbles as const generic params.
+/// This generates the impl that extracts Head (first nibble) and
+/// creates Tail (rotated version of the params).
+#[proc_macro]
+pub fn impl_byte_stream_128(_input: TokenStream) -> TokenStream {
+    inner::byte_stream::expand_impl_byte_stream_128().into()
+}
+
+/// Expand to: N0, N1, N2, N3, N4, N5, N6, N7, N8, N9, NA, NB, NC, ND, NE, NF
+///
+/// Use in generic parameters or tuple fields.
+#[proc_macro]
+pub fn node16_slots(_input: TokenStream) -> TokenStream {
+    inner::node16::expand_slots().into()
+}
+
+/// Expand to: Node16<N0, N1, N2, ..., NF>
+///
+/// Use in impl blocks and type positions.
+#[proc_macro]
+pub fn node16_type(_input: TokenStream) -> TokenStream {
+    inner::node16::expand_node16_type().into()
+}
+
+/// Generate all std trait detection infrastructure.
+///
+/// This generates:
+/// - Capability markers (IsClone, IsCopy, etc.) with hash-based streams
+/// - Fallback traits (CloneFallback, etc.)
+/// - Select traits (SelectClone, etc.)
+/// - AutoCaps trait with all IS_XXX consts
+#[proc_macro]
+pub fn define_std_traits(_input: TokenStream) -> TokenStream {
+    inner::std_traits::expand_std_traits().into()
+}
+
+/// Generate the impl_auto_caps! macro.
+#[proc_macro]
+pub fn define_impl_auto_caps_macro(_input: TokenStream) -> TokenStream {
+    inner::std_traits::expand_impl_auto_caps_macro().into()
+}
+
+/// Generate the impl_std_types! macro for primitives and core types.
+#[proc_macro]
+pub fn define_impl_std_types_macro(_input: TokenStream) -> TokenStream {
+    inner::std_types::expand_impl_std_types_macro().into()
+}
+
+#[proc_macro]
+pub fn define_impl_std_lib_types_macro(_input: TokenStream) -> TokenStream {
+    inner::std_types::expand_impl_std_lib_types_macro().into()
+}
+
+/// Generate the impl_alloc_types! macro for alloc types.
+#[proc_macro]
+pub fn define_impl_alloc_types_macro(_input: TokenStream) -> TokenStream {
+    inner::std_types::expand_impl_alloc_types_macro().into()
+}
+
+
+/// Internal: Convert a path string to a Finger Tree identity type.
+/// Used by #[derive(Capability)] to create stable, reproducible identities.
+/// The input must be: concat!(module_path!(), "::", stringify!(TypeName))
+#[proc_macro]
+pub fn __internal_make_identity(input: TokenStream) -> TokenStream {
+    let _input_str = input.to_string();
+    user::capability::expand_make_identity(input.into()).into()
+}
+
+/// Internal: Generate IdentityBytes type from module path string.
+/// Uses const fn pack_str_bytes for const evaluation after concat!() expansion.
+#[proc_macro]
+pub fn make_identity_bytes(input: TokenStream) -> TokenStream {
+    user::capability::expand_make_identity_bytes(input.into()).into()
+}
+
+
+
+/// Generate a type-level nibble stream from an identifier name.
+///
+/// Usage: `name_stream!(MyStruct)` expands to `Cons<X4, Cons<...> ...>`
+#[proc_macro]
+pub fn name_stream(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as inner::name_stream::NameStreamInput);
+    inner::name_stream::expand_name_stream(input).into()
+}
+
+/// Internal: Compute routing hash stream from a full module path string.
+/// Input must be a string literal (e.g. from `concat!`).
+#[proc_macro]
+pub fn make_routing_stream(input: TokenStream) -> TokenStream {
+    // Just delegates to the same logic as identity, but returns Stream type tokens
+    user::capability::expand_make_routing_stream(input.into()).into()
+}
+
+/// Implement `AutoCaps` and `AutoCapSet` for a type.
 ///
 /// # Usage
+/// ```ignore
+/// impl_auto_caps!(MyType);
+/// ```
+#[proc_macro]
+pub fn impl_auto_caps(input: TokenStream) -> TokenStream {
+    inner::std_traits::expand_impl_auto_caps(input.into()).into()
+}
+
+/// Attribute macro for Node16 struct and impl blocks.
+///
+/// # Modes
+///
+/// - `#[node16]` - Basic placeholder replacement
+/// - `#[node16(each_slot)]` - Per-slot expansion with `_Slot_` and `each(_Slots_)`
+/// - `#[node16(for_nibble)]` - Generate 16 impls, one per nibble/slot pair
+/// - `#[node16(all_empty)]` - Generate empty Node16 type alias
+///
+/// # Placeholders
+///
+/// - `_Slots_`  expands to N0, N1, ..., NF
+/// - `_Node16_` expands to Node16<N0, N1, ..., NF>
+/// - `each(_Slots_): Bound` expands to N0: Bound, ..., NF: Bound (each_slot mode)
+/// - `_Slot_` in statements: repeated 16 times (each_slot mode)
+/// - `_Nibble_` expands to X0, X1, ..., XF (for_nibble mode)
+/// - `_SlotN_` expands to N0, N1, ..., NF (for_nibble mode, paired with _Nibble_)
+///
+/// # Examples
 ///
 /// ```ignore
-/// // This transform must run BEFORE SvgOptimizedCap is added
-/// #[requires_not(C: SvgOptimizedCap)]
-/// fn raw_svg_transform<C>(doc: Doc<Indexed, C>) { ... }
+/// // Basic: struct and impl
+/// #[macros::node16]
+/// pub struct Node16<_Slots_>(PhantomData<(_Slots_,)>);
+///
+/// // Per-nibble impl (generates 16 impls)
+/// #[macros::node16(for_nibble)]
+/// impl<Cap, Depth, _Slots_> RouteQuery<Cap, Depth, _Nibble_> for _Node16_
+/// where _SlotN_: EvalAt<Has<Cap>, S<Depth>>
+/// {
+///     type Out = <_SlotN_ as EvalAt<Has<Cap>, S<Depth>>>::Out;
+/// }
 /// ```
-///
-/// # How It Works
-///
-/// The macro generates bounds using the `Evaluate` trait with `Not`:
-/// - Single cap: `C: Evaluate<Not<Has<Cap>>, Out = True>`
-/// - Multiple caps: `C: Evaluate<all![Not<Has<A>>, Not<Has<B>>], Out = True>`
-#[deprecated(since = "0.2.0", note = "Use `#[caps(conflicts = ...)]` instead")]
 #[proc_macro_attribute]
-pub fn requires_not(attr: TokenStream, item: TokenStream) -> TokenStream {
-    conflicts_impl(attr, item)
+pub fn node16(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr2: proc_macro2::TokenStream = attr.into();
+    let item2: proc_macro2::TokenStream = item.into();
+    let mode = inner::node16::parse_mode(attr2);
+    inner::node16::expand_trie16_with_mode(mode, item2).into()
 }
 
-/// Attribute macro to declare conflicting capabilities.
-///
-/// Alias for `#[requires_not]` with clearer semantics.
-///
-/// # Usage
-///
-/// ```ignore
-/// #[conflicts(C: SvgOptimizedCap)]
-/// fn must_run_before_svg<C>() { ... }
-/// ```
-#[deprecated(since = "0.2.0", note = "Use `#[caps(conflicts = ...)]` instead")]
-#[proc_macro_attribute]
-pub fn conflicts(attr: TokenStream, item: TokenStream) -> TokenStream {
-    conflicts_impl(attr, item)
+/// Generate all 65536 ByteEq impls for type-level byte comparison.
+#[proc_macro]
+pub fn impl_byte_eq(_input: TokenStream) -> TokenStream {
+    inner::byte_eq::expand_byte_eq_impls().into()
 }
-
-fn conflicts_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let attr = parse_macro_input!(attr as RequiresAttr);
-    let func = parse_macro_input!(item as ItemFn);
-
-    let type_param_ident = &attr.target;
-    let caps: Vec<&Type> = attr.caps.iter().collect();
-
-    if caps.is_empty() {
-        return func.into_token_stream().into();
-    }
-
-    let func_name = &func.sig.ident;
-    let func_vis = &func.vis;
-    let func_inputs = &func.sig.inputs;
-    let func_output = &func.sig.output;
-    let func_generics = &func.sig.generics;
-    let func_body = &func.block;
-    let func_attrs = &func.attrs;
-
-    let generic_params = &func_generics.params;
-    let where_clause = &func_generics.where_clause;
-
-    // Build the Evaluate bound with Not
-    let eval_bound = if caps.len() == 1 {
-        let cap = caps[0];
-        quote! {
-            ::tola_caps::Evaluate<::tola_caps::Not<::tola_caps::Has<#cap>>, Out = ::tola_caps::Present>
-        }
-    } else {
-        // Multiple caps: use All<HList> with Not<Has<...>> for each
-        let not_has_caps = caps.iter().map(|cap| {
-            quote! { ::tola_caps::Not<::tola_caps::Has<#cap>> }
-        });
-        quote! {
-            ::tola_caps::Evaluate<
-                ::tola_caps::All<::tola_caps::hlist![#(#not_has_caps),*]>,
-                Out = ::tola_caps::Present
-            >
-        }
-    };
-
-    // Build the where clause
-    let new_where = if let Some(wc) = where_clause {
-        let existing_predicates = &wc.predicates;
-        quote! {
-            where #existing_predicates, #type_param_ident: #eval_bound
-        }
-    } else {
-        quote! {
-            where #type_param_ident: #eval_bound
-        }
-    };
-
-    let output = quote! {
-        #(#func_attrs)*
-        #func_vis fn #func_name<#generic_params>(#func_inputs) #func_output #new_where
-        #func_body
-    };
-
-    output.into()
-}
-
-
 
 // =============================================================================
-// Unified #[caps] macro
+// User-facing Macros (user/)
 // =============================================================================
 
-/// Unified capability constraint macro with boolean expression support and auto-generic injection.
+/// Unified capability constraint macro with boolean expression support.
 ///
 /// # Usage
 ///
 /// ```ignore
+/// // Simple requirement
+/// #[caps_bound(CanRead)]
+/// fn read_doc<C>(doc: Doc<C>) { ... }
+///
+/// // Boolean logic
 /// #[caps_bound(requires = CanRead & (CanWrite | CanAdmin), conflicts = CanGuest)]
-/// fn secure_op(doc: Doc) { ... }
+/// fn secure_op<C>(doc: Doc<C>) { ... }
+///
+/// // Transparent mode (auto-inject generic)
+/// #[caps_bound(CanRead, transparent)]
+/// fn simple_read(doc: Doc) { ... }
 /// ```
-///
-/// This expands to:
-///
-/// ```ignore
-/// fn secure_op<C>(doc: Doc<C>)
-/// where
-///     C: Evaluate<And<Has<CanRead>, Or<Has<CanWrite>, Has<CanAdmin>>>, Out = True>,
-///     C: Evaluate<Not<Has<CanGuest>>, Out = True>
-/// { ... }
-/// ```
-///
-/// # Features
-///
-/// 1. **Boolean Logic**: Supports `&` (AND), `|` (OR), `!` (NOT), `()` (grouping).
-/// 2. **Auto-Generics**: Automatically injects `<C>` if `Doc` or other carrier types are present in args.
-/// 3. **Supports**: Functions, Structs, Enums, and Impl blocks.
 #[proc_macro_attribute]
 pub fn caps_bound(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as CapsArgs);
+    let args = parse_macro_input!(attr as user::CapsArgs);
 
-    // Try to parse as different item types
     let item_clone = item.clone();
-    if let Ok(func) = syn::parse::<ItemFn>(item_clone.clone()) {
-        return expand_caps_fn(args, func);
+    if let Ok(func) = syn::parse::<syn::ItemFn>(item_clone.clone()) {
+        return user::expand_caps_fn(args, func);
     }
 
     let item_clone = item.clone();
     if let Ok(item_struct) = syn::parse::<syn::ItemStruct>(item_clone.clone()) {
-        return expand_caps_struct(args, item_struct);
+        return user::expand_caps_struct(args, item_struct);
     }
 
     let item_clone = item.clone();
     if let Ok(item_enum) = syn::parse::<syn::ItemEnum>(item_clone.clone()) {
-        return expand_caps_enum(args, item_enum);
+        return user::expand_caps_enum(args, item_enum);
     }
 
     let item_clone = item.clone();
     if let Ok(item_impl) = syn::parse::<syn::ItemImpl>(item_clone) {
-        return expand_caps_impl(args, item_impl);
+        return user::expand_caps_impl(args, item_impl);
     }
 
-    // Fallback error
-    syn::Error::new(proc_macro2::Span::call_site(), "caps_bound supports fn, struct, enum, or impl")
-        .to_compile_error()
-        .into()
-}
-
-/// Check for duplicate capabilities in the list
-#[proc_macro]
-pub fn caps(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as CapsInput);
-    let types: Vec<_> = input.types.into_iter().collect();
-
-    // Check for duplicates
-    if let Err(err) = check_duplicates(&types) {
-        return err.to_compile_error().into();
-    }
-
-    let output = build_capset(&types);
-    output.into()
-}
-
-mod caps_impl {
-    use super::*;
-
-    use syn::{parse::{Parse, ParseStream}, Token, Type};
-
-    // --- AST for Boolean Expressions ---
-
-    #[derive(Clone, Debug)]
-    pub enum BoolExpr {
-        Cap(Type),
-        And(Box<BoolExpr>, Box<BoolExpr>),
-        Or(Box<BoolExpr>, Box<BoolExpr>),
-        Not(Box<BoolExpr>),
-    }
-
-    impl Parse for BoolExpr {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            parse_or(input)
-        }
-    }
-
-    // Recursive Descent Parser: Or -> And -> Unary -> Primary
-
-    fn parse_or(input: ParseStream) -> syn::Result<BoolExpr> {
-        let mut lhs = parse_and(input)?;
-
-        while input.peek(Token![|]) {
-            input.parse::<Token![|]>()?;
-            let rhs = parse_and(input)?;
-            lhs = BoolExpr::Or(Box::new(lhs), Box::new(rhs));
-        }
-        Ok(lhs)
-    }
-
-    fn parse_and(input: ParseStream) -> syn::Result<BoolExpr> {
-        let mut lhs = parse_unary(input)?;
-
-        while input.peek(Token![&]) {
-            input.parse::<Token![&]>()?;
-            let rhs = parse_unary(input)?;
-            lhs = BoolExpr::And(Box::new(lhs), Box::new(rhs));
-        }
-        Ok(lhs)
-    }
-
-    fn parse_unary(input: ParseStream) -> syn::Result<BoolExpr> {
-        if input.peek(Token![!]) {
-            input.parse::<Token![!]>()?;
-            let operand = parse_unary(input)?;
-            Ok(BoolExpr::Not(Box::new(operand)))
-        } else {
-            parse_primary(input)
-        }
-    }
-
-    fn parse_primary(input: ParseStream) -> syn::Result<BoolExpr> {
-        if input.peek(syn::token::Paren) {
-            let content;
-            syn::parenthesized!(content in input);
-            content.parse()
-        } else {
-            // Parse a type (Capability)
-            let ty: Type = input.parse()?;
-            Ok(BoolExpr::Cap(ty))
-        }
-    }
-
-    // --- Attributes Parsing ---
-
-    pub struct CapsArgs {
-        pub predicates: Vec<BoolExpr>,
-        pub with_caps: Vec<Type>,
-        pub without_caps: Vec<Type>,
-        pub transparent: bool,
-        pub target: Option<syn::Ident>,
-    }
-
-    impl Parse for CapsArgs {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            let mut predicates = Vec::new();
-            let mut with_caps = Vec::new();
-            let mut without_caps = Vec::new();
-            let mut transparent = false;
-            let mut target = None;
-
-            while !input.is_empty() {
-                // 1. Check for Named Arguments: key = value
-                if input.peek(Ident) && input.peek2(Token![=]) {
-                    let key: Ident = input.parse()?;
-                    input.parse::<Token![=]>()?;
-
-                    if key == "requires" {
-                        predicates.push(input.parse()?);
-                    } else if key == "conflicts" {
-                        let conflict: BoolExpr = input.parse()?;
-                        predicates.push(BoolExpr::Not(Box::new(conflict)));
-                    } else if key == "with" {
-                        with_caps.push(input.parse()?);
-                    } else if key == "without" {
-                        without_caps.push(input.parse()?);
-                    } else if key == "transparent" {
-                         // support transparent = true/false (legacy style)
-                         if input.peek(syn::LitBool) {
-                            let val: syn::LitBool = input.parse()?;
-                            transparent = val.value;
-                         } else {
-                             // allow bare 'transparent' if used as flag elsewhere?
-                             // But here we are in key=value block.
-                             // Assuming transparent=true if only transparent is key?
-                             // No, if key=value expected, value must be there.
-                             // But wait, my previous parser handled `transparent` in positional section (flag).
-                             // Here it is key=value.
-                             // I will stick to what was there.
-                             let val: syn::LitBool = input.parse()?;
-                             transparent = val.value;
-                         }
-                    } else if key == "target" {
-                        target = Some(input.parse()?);
-                    }
-                }
-                // 2. Check for Grouping: with(...) / without(...)
-                else if input.peek(Ident) && input.peek2(syn::token::Paren) && {
-                    let fork = input.fork();
-                    let key: Ident = fork.parse().unwrap();
-                    key == "with" || key == "without"
-                } {
-                    let key: Ident = input.parse()?;
-                    let content;
-                    syn::parenthesized!(content in input);
-                    let types = syn::punctuated::Punctuated::<Type, Token![,]>::parse_terminated(&content)?;
-
-                    if key == "with" {
-                        with_caps.extend(types);
-                    } else if key == "without" {
-                        without_caps.extend(types);
-                    }
-                }
-                // 3. Check for Flags: transparent
-                else if input.peek(Ident) && {
-                    let fork = input.fork();
-                    let key: Ident = fork.parse().unwrap();
-                    key == "transparent"
-                } {
-                    let _: Ident = input.parse()?; // consume
-                    transparent = true;
-                }
-                // 4. Positional Boolean Expression (Requires / !Conflicts)
-                else {
-                    let expr: BoolExpr = input.parse()?;
-                    predicates.push(expr);
-                }
-
-                if input.peek(Token![,]) {
-                    input.parse::<Token![,]>()?;
-                }
-            }
-
-            Ok(CapsArgs { predicates, with_caps, without_caps, transparent, target })
-        }
-    }
-}
-
-use caps_impl::{CapsArgs, BoolExpr};
-
-// Helper to pretty-print BoolExpr
-fn bool_expr_to_string(expr: &BoolExpr) -> String {
-    match expr {
-        BoolExpr::Cap(ty) => quote::quote!(#ty).to_string().replace(" ", ""),
-        BoolExpr::And(lhs, rhs) => format!("({} & {})", bool_expr_to_string(lhs), bool_expr_to_string(rhs)),
-        BoolExpr::Or(lhs, rhs) => format!("({} | {})", bool_expr_to_string(lhs), bool_expr_to_string(rhs)),
-        BoolExpr::Not(operand) => format!("!{}", bool_expr_to_string(operand)),
-    }
-}
-
-// Helper to generate predicates from args (Legacy/Simple for Structs)
-fn generate_predicates(args: &CapsArgs, bound_param: &syn::Ident) -> Vec<proc_macro2::TokenStream> {
-    let mut output_tokens = Vec::new();
-
-    for pred in &args.predicates {
-        let type_expr = bool_expr_to_type(pred);
-        output_tokens.push(quote! {
-            #bound_param: ::tola_caps::Require<#type_expr>
-        });
-    }
-
-    for cap in &args.with_caps {
-        output_tokens.push(quote! {
-            #bound_param: ::tola_caps::With<#cap>
-        });
-    }
-
-    for cap in &args.without_caps {
-        output_tokens.push(quote! {
-            #bound_param: ::tola_caps::Without<#cap>
-        });
-    }
-
-    output_tokens
-}
-
-// Generate unique traits for each predicate to support custom diagnostic messages
-fn generate_predicate_traits(
-    args: &CapsArgs,
-    bound_param: &syn::Ident,
-    fn_name: &syn::Ident
-) -> (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>) {
-    let mut bounds = Vec::new();
-    let mut definitions = Vec::new();
-
-    for (i, pred) in args.predicates.iter().enumerate() {
-        let type_expr = bool_expr_to_type(pred);
-        let msg_str = bool_expr_to_string(pred);
-
-        // Generate a unique name for this requirement trait
-        // e.g. __Req_myfunc_0
-        let trait_name = format_ident!("__Req_{}_{}", fn_name, i);
-
-        let message = format!("Capability requirement failed: {}", msg_str);
-        let label = format!("This capability set violates requirement '{}'", msg_str);
-
-        // Generate the definition
-        definitions.push(quote! {
-            #[allow(non_camel_case_types)]
-            #[diagnostic::on_unimplemented(
-                message = #message,
-                label = #label,
-                note = "Check if you are missing a required capability or possess a conflicting one."
-            )]
-            pub trait #trait_name {
-                 // Bake the message into a const for potential introspection (optional)
-                 const MSG: &'static str = #msg_str;
-            }
-
-            impl<C> #trait_name for C
-            where
-                C: ::tola_caps::Evaluate<#type_expr>,
-                <C as ::tola_caps::Evaluate<#type_expr>>::Out: ::tola_caps::IsTrue<C, #type_expr>
-            {}
-        });
-
-        // Generate the bound
-        bounds.push(quote! {
-            #bound_param: #trait_name
-        });
-    }
-
-    (bounds, definitions)
-}
-
-fn expand_caps_fn(args: CapsArgs, mut func: ItemFn) -> TokenStream {
-    let generic_param = format_ident!("__C");
-    let fn_name = func.sig.ident.clone();
-
-    if args.transparent {
-        let insert_pos = find_insert_position(&func.sig.generics.params);
-        func.sig.generics.params.insert(insert_pos, syn::parse_quote!(#generic_param));
-
-        for arg in &mut func.sig.inputs {
-            if let syn::FnArg::Typed(pat_type) = arg {
-                if let Type::Path(type_path) = &mut *pat_type.ty {
-                    if let Some(last_seg) = type_path.path.segments.last_mut() {
-                        if last_seg.ident == "Doc" {
-                            if let syn::PathArguments::None = last_seg.arguments {
-                                last_seg.arguments = syn::PathArguments::AngleBracketed(syn::parse_quote!(<#generic_param>));
-                            } else if let syn::PathArguments::AngleBracketed(ga) = &mut last_seg.arguments {
-                                 ga.args.push(syn::parse_quote!(#generic_param));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let bound_param = if let Some(target) = args.target.clone() {
-        target
-    } else if args.transparent {
-        generic_param.clone()
-    } else {
-        func.sig.generics.params.iter()
-            .filter_map(|p| if let syn::GenericParam::Type(t) = p { Some(t.ident.clone()) } else { None })
-            .next()
-            .unwrap_or_else(|| format_ident!("C"))
-    };
-
-    // Generate predicate traits and bounds
-    let (pred_bounds, pred_defs) = generate_predicate_traits(&args, &bound_param, &fn_name);
-
-    if let Some(wc) = &mut func.sig.generics.where_clause {
-         for b in pred_bounds {
-             wc.predicates.push(syn::parse_quote!(#b));
-         }
-    } else {
-        let mut wc: syn::WhereClause = syn::parse_quote!(where);
-        for b in pred_bounds {
-             wc.predicates.push(syn::parse_quote!(#b));
-        }
-        func.sig.generics.where_clause = Some(wc);
-    }
-
-    // Add With/Without bounds (these don't need custom messages as much, or can use standard wrappers)
-    // We can keep using standard implementation for them
-    let where_clause = func.sig.generics.make_where_clause();
-
-    for cap in &args.with_caps {
-        where_clause.predicates.push(syn::parse_quote!(
-            #bound_param: ::tola_caps::With<#cap>
-        ));
-    }
-
-    for cap in &args.without_caps {
-        where_clause.predicates.push(syn::parse_quote!(
-            #bound_param: ::tola_caps::Without<#cap>
-        ));
-    }
-
-    // Output: definitions + function
-    quote! {
-        #(#pred_defs)*
-        #func
-    }.into()
-}
-
-fn expand_caps_struct(args: CapsArgs, mut item: syn::ItemStruct) -> TokenStream {
-    let bound_param = if let Some(target) = args.target.clone() {
-        target
-    } else {
-        item.generics.params.iter()
-            .filter_map(|p| if let syn::GenericParam::Type(t) = p { Some(t.ident.clone()) } else { None })
-            .next()
-            .unwrap_or_else(|| format_ident!("C"))
-    };
-
-    let predicates = generate_predicates(&args, &bound_param);
-    let where_clause = item.generics.make_where_clause();
-    for pred in predicates {
-        where_clause.predicates.push(syn::parse_quote!(#pred));
-    }
-
-    item.into_token_stream().into()
-}
-
-fn expand_caps_enum(args: CapsArgs, mut item: syn::ItemEnum) -> TokenStream {
-    let bound_param = if let Some(target) = args.target.clone() {
-        target
-    } else {
-        item.generics.params.iter()
-            .filter_map(|p| if let syn::GenericParam::Type(t) = p { Some(t.ident.clone()) } else { None })
-            .next()
-            .unwrap_or_else(|| format_ident!("C"))
-    };
-
-    let predicates = generate_predicates(&args, &bound_param);
-    let where_clause = item.generics.make_where_clause();
-    for pred in predicates {
-        where_clause.predicates.push(syn::parse_quote!(#pred));
-    }
-
-    item.into_token_stream().into()
-}
-
-fn expand_caps_impl(args: CapsArgs, mut item: syn::ItemImpl) -> TokenStream {
-    let bound_param = if let Some(target) = args.target.clone() {
-        target
-    } else {
-        item.generics.params.iter()
-            .filter_map(|p| if let syn::GenericParam::Type(t) = p { Some(t.ident.clone()) } else { None })
-            .next()
-            .unwrap_or_else(|| format_ident!("C"))
-    };
-
-    let predicates = generate_predicates(&args, &bound_param);
-    let where_clause = item.generics.make_where_clause();
-    for pred in predicates {
-        where_clause.predicates.push(syn::parse_quote!(#pred));
-    }
-
-    item.into_token_stream().into()
-}
-
-/// Find the correct insertion position for __C in generic params.
-/// Returns index where __C should be inserted.
-/// Order: lifetimes, then types (non-default), then __C, then types (with default), then consts.
-fn find_insert_position(params: &syn::punctuated::Punctuated<syn::GenericParam, syn::token::Comma>) -> usize {
-    let mut pos = 0;
-    for (i, param) in params.iter().enumerate() {
-        match param {
-            syn::GenericParam::Lifetime(_) => {
-                // Lifetimes come first, keep going
-                pos = i + 1;
-            }
-            syn::GenericParam::Type(t) => {
-                // If this type has a default, insert before it
-                if t.default.is_some() {
-                    return pos;
-                }
-                // Non-default type, keep going
-                pos = i + 1;
-            }
-            syn::GenericParam::Const(_) => {
-                // Const params come at end, insert before them
-                return pos;
-            }
-        }
-    }
-    pos
-}
-
-fn bool_expr_to_type(expr: &BoolExpr) -> proc_macro2::TokenStream {
-    match expr {
-        BoolExpr::Cap(ty) => quote! { #ty },
-        BoolExpr::And(lhs, rhs) => {
-            let l = bool_expr_to_type(lhs);
-            let r = bool_expr_to_type(rhs);
-            quote! { ::tola_caps::And<#l, #r> }
-        },
-        BoolExpr::Or(lhs, rhs) => {
-            let l = bool_expr_to_type(lhs);
-            let r = bool_expr_to_type(rhs);
-            quote! { ::tola_caps::Or<#l, #r> }
-        },
-        BoolExpr::Not(operand) => {
-            let o = bool_expr_to_type(operand);
-            quote! { ::tola_caps::Not<#o> }
-        },
-    }
-}
-
-
-/// Single capability definition: `Name => "doc string"`
-struct CapDef {
-    name: Ident,
-    doc: LitStr,
-}
-
-impl Parse for CapDef {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name: Ident = input.parse()?;
-        let _arrow: Token![=>] = input.parse()?;
-        let doc: LitStr = input.parse()?;
-        Ok(CapDef { name, doc })
-    }
-}
-
-/// Multiple capability definitions separated by commas
-struct DefineCapabilitiesInput {
-    caps: Punctuated<CapDef, Token![,]>,
-}
-
-impl Parse for DefineCapabilitiesInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let caps = Punctuated::parse_terminated(input)?;
-        Ok(DefineCapabilitiesInput { caps })
-    }
-}
-
-/// Batch define capabilities with auto-generated `Cap` suffix and doc comments.
-///
-/// This macro generates:
-/// 1. The capability struct (e.g., `LinksCheckedCap`)
-/// 2. A unique `HasXxxCap` trait for searching (e.g., `HasLinksCheckedCap`)
-/// 3. Base impl: `(XxxCap, Rest)` implements `HasXxxCap`
-/// 4. Recursive impls: `(OtherCap, Rest)` implements `HasXxxCap` if `Rest` does
-///
-/// # Usage
-///
-/// ```ignore
-/// define_capabilities! {
-///     LinksChecked => "Links have been checked (existence validated)",
-///     LinksResolved => "Links have been resolved (relative → absolute paths)",
-/// }
-/// ```
-///
-/// Expands to:
-/// - `LinksCheckedCap`, `LinksResolvedCap` (structs)
-/// - `HasLinksCheckedCap`, `HasLinksResolvedCap` (presence traits)
-/// - `NotHasLinksCheckedCap`, `NotHasLinksResolvedCap` (absence traits)
-#[proc_macro]
-pub fn define_capabilities(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DefineCapabilitiesInput);
-    let caps: Vec<_> = input.caps.into_iter().collect();
-
-    // Collect all capability names for cross-recursive impls
-    let cap_names: Vec<_> = caps.iter().map(|c| &c.name).collect();
-    let cap_structs: Vec<_> = cap_names
-        .iter()
-        .map(|n| format_ident!("{}Cap", n))
-        .collect();
-    let has_traits: Vec<_> = cap_names
-        .iter()
-        .map(|n| format_ident!("Has{}Cap", n))
-        .collect();
-    let not_has_traits: Vec<_> = cap_names
-        .iter()
-        .map(|n| format_ident!("NotHas{}Cap", n))
-        .collect();
-
-    // Generate struct definitions, trait definitions, and base impls
-    let struct_defs: Vec<_> = caps
-        .iter()
-        .zip(cap_structs.iter())
-        .zip(has_traits.iter())
-        .zip(not_has_traits.iter())
-        .map(|(((cap, struct_name), has_trait), not_has_trait)| {
-            let doc = &cap.doc;
-            let name_str = cap.name.to_string();
-            let struct_name_str = struct_name.to_string();
-
-            // Pre-compute diagnostic messages as string literals
-            let has_diag_message = format!(
-                "capability `{}` is required but not available in `{{Self}}`",
-                struct_name_str
-            );
-            let has_diag_label = format!("this transform requires `{}`", struct_name_str);
-            let has_doc_trait = format!(
-                "Trait to check if a capability set contains `{}`",
-                struct_name_str
-            );
-
-            let not_has_diag_message = format!(
-                "capability `{}` must NOT be present in `{{Self}}`",
-                struct_name_str
-            );
-            let not_has_diag_label = format!(
-                "this transform must run BEFORE `{}` is added",
-                struct_name_str
-            );
-            let not_has_doc_trait = format!(
-                "Trait to check if a capability set does NOT contain `{}`",
-                struct_name_str
-            );
-
-            let doc_marker = format!("Marker: {}", doc.value());
-
-            quote! {
-                #[doc = #doc_marker]
-                #[derive(Debug, Clone, Copy, Default)]
-                pub struct #struct_name;
-
-                impl sealed::Sealed for #struct_name {}
-
-                impl Capability for #struct_name {
-                    const NAME: &'static str = #name_str;
-                }
-
-                // === HasXxxCap trait (presence check) ===
-                #[doc = #has_doc_trait]
-                #[diagnostic::on_unimplemented(
-                    message = #has_diag_message,
-                    label = #has_diag_label,
-                    note = "try adding the appropriate Transform earlier in the pipeline"
-                )]
-                pub trait #has_trait: Capabilities {}
-
-                // Base case: this cap at head
-                impl<Rest: Capabilities> #has_trait for (#struct_name, Rest) {}
-
-                // === NotHasXxxCap trait (absence check) ===
-                #[doc = #not_has_doc_trait]
-                #[doc = ""]
-                #[doc = "Use with `#[requires_not]` to enforce ordering constraints."]
-                #[diagnostic::on_unimplemented(
-                    message = #not_has_diag_message,
-                    label = #not_has_diag_label,
-                    note = "this transform must run earlier in the pipeline"
-                )]
-                pub trait #not_has_trait: Capabilities {}
-
-                // Base case: empty set does not contain any cap
-                impl #not_has_trait for () {}
-
-                // NOTE: We do NOT impl NotHasXxxCap for (XxxCap, Rest)!
-                // This is the key: if XxxCap is at head, the trait is NOT satisfied.
-            }
-        })
-        .collect();
-
-    // Generate cross-recursive impls for HasXxxCap
-    let has_cross_impls: Vec<_> = has_traits
-        .iter()
-        .enumerate()
-        .flat_map(|(target_idx, target_trait)| {
-            cap_structs
-                .iter()
-                .enumerate()
-                .filter(move |(other_idx, _)| *other_idx != target_idx)
-                .map(move |(_, other_struct)| {
-                    quote! {
-                        impl<Rest: #target_trait> #target_trait for (#other_struct, Rest) {}
-                    }
-                })
-        })
-        .collect();
-
-    // Cross-recursive impls for NotHasXxxCap:
-    // (OtherCap, Rest) satisfies NotHasXxxCap if Rest does.
-    // (XxxCap, Rest) has no impl, so it never satisfies NotHasXxxCap.
-    let not_has_cross_impls: Vec<_> = not_has_traits
-        .iter()
-        .enumerate()
-        .flat_map(|(target_idx, target_trait)| {
-            cap_structs
-                .iter()
-                .enumerate()
-                .filter(move |(other_idx, _)| *other_idx != target_idx)
-                .map(move |(_, other_struct)| {
-                    quote! {
-                        impl<Rest: #target_trait> #target_trait for (#other_struct, Rest) {}
-                    }
-                })
-        })
-        .collect();
-
-    let output = quote! {
-        #(#struct_defs)*
-        #(#has_cross_impls)*
-        #(#not_has_cross_impls)*
-    };
-
-    output.into()
-}
-
-// =============================================================================
-// caps! proc-macro
-// =============================================================================
-
-/// Parse a list of types for caps! macro
-struct CapsInput {
-    types: Punctuated<Type, Token![,]>,
-}
-
-impl Parse for CapsInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let types = Punctuated::parse_terminated(input)?;
-        Ok(CapsInput { types })
-    }
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "caps_bound supports fn, struct, enum, or impl",
+    )
+    .to_compile_error()
+    .into()
 }
 
 /// Create a capability set type from a list of capabilities.
 ///
-/// This macro converts a list of capabilities into the trie representation:
+/// # Usage
 /// ```ignore
-/// caps![A, B, C]  // expands to: <<Empty as Add<C>>::Out as Add<B>>::Out as Add<A>>::Out
-/// caps![]         // expands to: Empty
-/// ```
+/// // Define capability set type
+/// type MyCaps = caps![CanRead, CanWrite];
 ///
-/// Useful for type annotations:
-/// ```ignore
-/// type FullyProcessed = caps![LinksResolvedCap, LinksCheckedCap, SvgOptimizedCap];
-/// ```
+/// // Empty set
+/// type NoCaps = caps![];
 ///
-/// # Compile Error on Duplicates
-///
-/// Duplicate capabilities are not allowed and will cause a compile error:
-/// ```ignore
-/// caps![CapA, CapA]  // ERROR: duplicate capability `CapA`
+/// // Use in function signature
+/// fn process<C: Evaluate<CanRead, Out = Present>>() { }
+/// process::<caps![CanRead, CanWrite]>();
 /// ```
 #[proc_macro]
-pub fn cap_set(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as CapsInput);
+pub fn caps(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as user::CapsInput);
     let types: Vec<_> = input.types.into_iter().collect();
 
-    // Check for duplicates
-    if let Err(err) = check_duplicates(&types) {
+    if let Err(err) = user::check_duplicates(&types) {
         return err.to_compile_error().into();
     }
 
-    let output = build_capset(&types);
-    output.into()
+    user::build_capset(&types).into()
 }
 
-/// Check for duplicate capabilities in the list
-fn check_duplicates(types: &[Type]) -> syn::Result<()> {
-    use std::collections::HashSet;
+/// Create a capability set type (alias for `caps!`).
+#[proc_macro]
+pub fn cap_set(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as user::CapsInput);
+    let types: Vec<_> = input.types.into_iter().collect();
 
-    let mut seen = HashSet::new();
-    for ty in types {
-        let ty_str = ty.to_token_stream().to_string().replace(" ", "");
-        if !seen.insert(ty_str.clone()) {
-            return Err(syn::Error::new_spanned(
-                ty,
-                format!(
-                    "duplicate capability `{}`\n\
-                     \n\
-                     Each capability should appear only once in a capability set.\n\
-                     Duplicate capabilities cause type inference ambiguity.",
-                    ty_str
-                ),
-            ));
-        }
+    if let Err(err) = user::check_duplicates(&types) {
+        return err.to_compile_error().into();
     }
-    Ok(())
+
+    user::build_capset(&types).into()
 }
 
-/// Build capset type: <<Empty as Add<C>>::Out as Add<B>>::Out as Add<A>>::Out
-fn build_capset(types: &[Type]) -> proc_macro2::TokenStream {
-    if types.is_empty() {
-        quote! { ::tola_caps::Empty }
-    } else {
-        // Build from right to left: Add<C>, then Add<B>, then Add<A>
-        // Result: <<Empty as Add<C>>::Out as Add<B>>::Out as Add<A>>::Out
-        let mut result = quote! { ::tola_caps::Empty };
-        for ty in types.iter().rev() {
-            result = quote! { <#result as ::tola_caps::With<#ty>>::Out };
-        }
-        result
-    }
+/// Batch define capabilities with auto-generated `Cap` suffix.
+///
+/// # Usage
+/// ```ignore
+/// define_capabilities! {
+///     LinksChecked => "Links have been checked",
+///     LinksResolved => "Links have been resolved",
+///     SvgOptimized => "SVG content has been optimized",
+/// }
+/// // Generates: LinksCheckedCap, LinksResolvedCap, SvgOptimizedCap
+/// // Plus HasXxxCap and NotHasXxxCap traits for each
+/// ```
+#[proc_macro]
+pub fn define_capabilities(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as user::DefineCapabilitiesInput);
+    user::expand_define_capabilities(input).into()
 }
-
-// =============================================================================
-// #[derive(Capability)] derive macro
-// =============================================================================
 
 /// Derive macro to automatically implement the `Capability` trait.
 ///
-/// This macro computes a SHA-256 hash of the struct name and generates
-/// a `HashStream` type that produces nibbles from this hash.
+/// Computes a BLAKE3 hash of the struct name and generates a `HashStream` type.
 ///
 /// # Usage
-///
 /// ```ignore
-/// use tola_caps::Capability;
+/// #[derive(Capability)]
+/// struct CanRead;
 ///
 /// #[derive(Capability)]
-/// struct MyCustomCap;
+/// struct CanWrite;
 ///
-/// // Automatically generates:
-/// // impl Capability for MyCustomCap {
-/// //     type Stream = Cons<X?, Cons<X?, ...>>;
-/// //     type At<D> = ...;
-/// // }
+/// // Now you can use:
+/// type MyCaps = caps![CanRead, CanWrite];
 /// ```
-///
-/// # Hash Generation
-///
-/// The hash is computed from the struct's fully qualified name (as seen by the macro).
-/// This ensures different modules/crates get different hashes even for same-named types.
 #[proc_macro_derive(Capability)]
 pub fn derive_capability(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-    let name_str = name.to_string();
-
-    // Compute BLAKE3 hash of the type name
-    let hash = blake3::hash(name_str.as_bytes());
-
-    // Convert first 16 bytes (32 nibbles) to Cons chain
-    // We use 16 bytes = 32 nibbles, which is enough for most cases
-    let nibbles: Vec<_> = hash.as_bytes().iter()
-        .take(16)
-        .flat_map(|byte| {
-            let high = (byte >> 4) & 0x0F;
-            let low = byte & 0x0F;
-            vec![high, low]
-        })
-        .collect();
-
-    // Generate the stream type: Cons<X?, Cons<X?, ...ConstStream<X?>>>
-    // Use the last nibble for ConstStream tail
-    let stream_type = build_hash_stream(&nibbles);
-
-    let output = quote! {
-        impl ::tola_caps::Capability for #name {
-            type Stream = #stream_type;
-            type At<D> = <<Self::Stream as ::tola_caps::GetTail<D>>::Out as ::tola_caps::HashStream>::Head
-            where Self::Stream: ::tola_caps::GetTail<D>;
-        }
-    };
-
-    output.into()
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    user::expand_derive_capability(input).into()
 }
 
-/// Build hash stream type from nibbles: Cons<X0, Cons<X1, ... ConstStream<XN>>>
-fn build_hash_stream(nibbles: &[u8]) -> proc_macro2::TokenStream {
-    if nibbles.is_empty() {
-        quote! { ::tola_caps::ConstStream<::tola_caps::X0> }
-    } else if nibbles.len() == 1 {
-        let nib = nibble_to_ident(nibbles[0]);
-        quote! { ::tola_caps::ConstStream<::tola_caps::#nib> }
-    } else {
-        let head = nibble_to_ident(nibbles[0]);
-        let tail = build_hash_stream(&nibbles[1..]);
-        quote! { ::tola_caps::Cons<::tola_caps::#head, #tail> }
+/// Derive macro to auto-detect standard trait implementations.
+///
+/// This is the recommended way to enable `caps_check!` for user-defined types.
+///
+/// # Usage
+/// ```ignore
+/// #[derive(Clone, Debug, AutoCaps)]
+/// struct MyType { data: String }
+///
+/// // Now you can check traits:
+/// assert!(caps_check!(MyType: Clone));
+/// assert!(caps_check!(MyType: Debug));
+/// assert!(!caps_check!(MyType: Copy));
+/// ```
+#[proc_macro_derive(AutoCaps)]
+pub fn derive_autocaps(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    user::expand_derive_autocaps(input).into()
+}
+
+/// Attribute macro to enable a trait for the caps system.
+///
+/// Use this on trait definitions to allow `caps_check!(T: TraitName)`.
+///
+/// # Usage
+/// ```ignore
+/// #[trait_autocaps]
+/// trait Serializable {
+///     fn serialize(&self) -> Vec<u8>;
+/// }
+///
+/// // Now you can check:
+/// assert!(caps_check!(MySerializableType: Serializable));
+/// ```
+#[proc_macro_attribute]
+pub fn trait_autocaps(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let _ = attr; // Unused for now
+    user::expand_trait_autocaps(item)
+}
+
+/// Derive macro to create capability-tracked structs with PhantomData.
+///
+/// Automatically adds a `_caps: PhantomData<C>` field and conversion methods.
+///
+/// # Usage
+/// ```ignore
+/// #[derive(CapHolder)]
+/// struct Doc {
+///     content: String,
+/// }
+///
+/// // Expands to:
+/// // struct Doc<C = Empty> {
+/// //     content: String,
+/// //     _caps: PhantomData<C>,
+/// // }
+///
+/// // Now use it with capabilities:
+/// let doc: Doc<caps![Parsed]> = doc.with_caps();
+/// ```
+#[proc_macro_derive(CapHolder)]
+pub fn derive_cap_holder(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    user::capability::expand_derive_cap_holder(input).into()
+}
+
+/// #[specialize] attribute macro for distributed specialization across files.
+///
+/// Mark individual items as default with `#[specialize(default)]`.
+/// Supports multi-generic constraints.
+///
+/// # Usage
+/// ```ignore
+/// trait MyTrait {
+///     type Output;
+///     fn describe(&self) -> Self::Output;
+/// }
+///
+/// // Most general (default) implementation
+/// #[specialize(default)]
+/// impl<T> MyTrait for T {
+///     type Output = ();
+///     fn describe(&self) -> Self::Output { () }
+/// }
+///
+/// // More specific - with constraint
+/// #[specialize(T: Clone)]
+/// impl<T> MyTrait for T {
+///     type Output = T;
+///     fn describe(&self) -> Self::Output { self.clone() }
+/// }
+///
+/// // Multiple generics
+/// #[specialize(T: Clone, U: Copy)]
+/// impl<T, U> Pair<T, U> for (T, U) { ... }
+///
+/// // Most specific - concrete type
+/// #[specialize]
+/// impl MyTrait for String {
+///     fn describe(&self) -> Self::Output { self.clone() }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn specialize(attr: TokenStream, item: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_attr(attr, item)
+}
+
+/// Nightly-like specialization block syntax on Stable Rust.
+///
+/// # Features
+/// - `default fn` / `default type` - fine-grained control over what can be specialized
+/// - Associated type specialization
+/// - Multi-level specialization chains (A < B < C < ...)
+/// - Custom trait-to-capability mapping via `#[map(MyTrait => IsMyTrait)]`
+/// - Overlap detection with helpful error messages
+///
+/// # Usage
+/// ```ignore
+/// specialization! {
+///     trait MyTrait {
+///         type Output;
+///         fn method(&self) -> Self::Output;
+///     }
+///
+///     impl<T> MyTrait for T {
+///         default type Output = ();
+///         default fn method(&self) -> Self::Output { () }
+///     }
+///
+///     impl<T: Clone> MyTrait for T {
+///         type Output = T;
+///         fn method(&self) -> Self::Output { self.clone() }
+///     }
+///
+///     // Most specific
+///     impl MyTrait for String {
+///         fn method(&self) -> Self::Output { self.clone() }
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn specialization(input: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_macro(input)
+}
+
+/// Nightly-like specialization for inherent impls.
+///
+/// # Usage
+/// ```ignore
+/// specialization_inherent! {
+///     impl<T> MyStruct<T> {
+///         default fn do_something(&self) { /* fallback */ }
+///     }
+///
+///     impl<T: Clone> MyStruct<T> {
+///         fn do_something(&self) { /* when T: Clone */ }
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn specialization_inherent(input: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_inherent(input)
+}
+
+// Keep old names as aliases for backwards compatibility
+/// Alias for `specialization!` (backwards compatibility)
+#[proc_macro]
+pub fn specialize_block(input: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_macro(input)
+}
+
+/// Alias for `specialization_inherent!` (backwards compatibility)
+#[proc_macro]
+pub fn specialize_inherent(input: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_inherent(input)
+}
+
+/// Legacy alias - use `#[specialize]` instead
+#[proc_macro_attribute]
+pub fn specialization_attr(attr: TokenStream, item: TokenStream) -> TokenStream {
+    user::specialize::expand_specialize_attr(attr, item)
+}
+
+/// Check if types satisfy trait constraints with boolean expression support.
+///
+/// Returns `true` or `false` at runtime based on compile-time trait detection.
+///
+/// # Syntax: `caps_check!(Type: Expr, ...)`
+///
+/// Supports multiple checks in one call. All checks must pass for result to be true.
+///
+/// ```ignore
+/// use std::fmt::Debug;
+/// use tola_caps::caps_check;
+///
+/// // Single check
+/// assert!(caps_check!(String: Clone));
+/// assert!(!caps_check!(String: Copy));
+///
+/// // Boolean expressions
+/// assert!(caps_check!(i32: Clone & Copy));
+/// assert!(caps_check!(String: Clone | Copy));
+/// assert!(caps_check!(String: Clone & !Copy));
+/// assert!(caps_check!(i32: (Clone | Copy) & Debug));
+///
+/// // Multiple checks (all must pass)
+/// assert!(caps_check!(String: Clone, i32: Copy));
+/// assert!(caps_check!(String: Clone & !Copy, i32: Clone & Copy));
+///
+/// // Mix concrete and generic types
+/// fn check<T: AutoCaps>() -> bool {
+///     caps_check!(T: Clone, String: Debug)
+/// }
+///
+/// // Custom traits work on concrete types
+/// trait MyTrait {}
+/// impl MyTrait for String {}
+/// assert!(caps_check!(String: MyTrait));
+/// ```
+#[proc_macro]
+pub fn caps_check(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as CapsCheckInput);
+    expand_caps_check(input).into()
+}
+
+/// Define a type capability marker.
+///
+/// # Usage
+/// ```ignore
+/// define_type_cap!(String);  // Generates TypeIsString marker struct
+/// define_type_cap!(Vec);     // Generates TypeIsVec marker struct
+///
+/// // Use for type-based specialization
+/// impl<T: TypeIsString> MyTrait for T { ... }
+/// ```
+#[proc_macro]
+pub fn define_type_cap(input: TokenStream) -> TokenStream {
+    user::define_type_cap(input)
+}
+
+/// Generate capability marker and detection for a custom trait.
+///
+/// For `derive_trait_cap!(MySerializable)` generates:
+/// - `IsMySerializable` - capability marker
+/// - `MySerializableFallback` - fallback trait
+/// - Inherent const `IS_MY_SERIALIZABLE` for implementing types
+///
+/// # Example
+/// ```ignore
+/// trait MySerializable { fn serialize(&self) -> Vec<u8>; }
+/// derive_trait_cap!(MySerializable);
+///
+/// // Use in specialize! - auto-detected
+/// specialize! {
+///     impl<T: MySerializable> Format for T { /* ... */ }
+/// }
+/// ```
+#[proc_macro]
+pub fn derive_trait_cap(input: TokenStream) -> TokenStream {
+    user::derive_trait_cap(input)
+}
+
+/// Attribute macro to automatically implement AutoCaps and AutoCapSet for a type.
+///
+/// # Usage
+/// ```ignore
+/// #[auto_caps]
+/// struct MyType {
+///     data: String,
+/// }
+///
+/// // Now you can use caps_check! on MyType
+/// assert!(caps_check!(MyType, Clone));
+/// ```
+#[proc_macro_attribute]
+pub fn auto_caps(attr: TokenStream, item: TokenStream) -> TokenStream {
+    user::expand_auto_caps(attr, item)
+}
+
+/// Unified capability attribute macro.
+///
+/// # On Trait: Register trait for caps system
+/// ```ignore
+/// #[cap]
+/// trait Serializable {
+///     fn serialize(&self) -> Vec<u8>;
+/// }
+/// // Generates: IsSerializable marker, is_serializable::<T>() function
+/// // Now usable in specialize! without #[map]
+/// ```
+///
+/// # On Struct/Enum: Auto-detect standard traits
+/// ```ignore
+/// #[cap]
+/// struct MyType { data: String }
+/// // Enables trait detection via caps system
+/// ```
+///
+/// **DEPRECATED**: Use `#[derive(AutoCaps)]` for types and `#[trait_autocaps]` for traits.
+#[deprecated(note = "Use `#[derive(AutoCaps)]` for types and `#[trait_autocaps]` for traits instead")]
+#[proc_macro_attribute]
+pub fn cap(attr: TokenStream, item: TokenStream) -> TokenStream {
+    user::expand_cap_attr(attr, item)
+}
+
+// =============================================================================
+// caps_check! Implementation (Unified)
+// =============================================================================
+
+/// Single type check: `Type: Expr`
+struct TypeCheck {
+    ty: syn::Type,
+    expr: common::BoolExpr,
+}
+
+impl syn::parse::Parse for TypeCheck {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let ty: syn::Type = input.parse()?;
+        input.parse::<syn::Token![:]>()?;
+        let expr: common::BoolExpr = input.parse()?;
+        Ok(TypeCheck { ty, expr })
     }
 }
 
-/// Convert a nibble (0-15) to its type identifier (X0-XF)
-fn nibble_to_ident(n: u8) -> proc_macro2::Ident {
-    let name = match n {
-        0 => "X0", 1 => "X1", 2 => "X2", 3 => "X3",
-        4 => "X4", 5 => "X5", 6 => "X6", 7 => "X7",
-        8 => "X8", 9 => "X9", 10 => "XA", 11 => "XB",
-        12 => "XC", 13 => "XD", 14 => "XE", 15 => "XF",
-        _ => "X0",
-    };
-    format_ident!("{}", name)
+/// Input for caps_check! macro: one or more type checks
+struct CapsCheckInput {
+    checks: Vec<TypeCheck>,
+}
+
+impl syn::parse::Parse for CapsCheckInput {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut checks = Vec::new();
+
+        // Parse first check (required)
+        checks.push(input.parse()?);
+
+        // Parse additional checks separated by commas
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            checks.push(input.parse()?);
+        }
+
+        Ok(CapsCheckInput { checks })
+    }
+}
+
+fn expand_caps_check(input: CapsCheckInput) -> proc_macro2::TokenStream {
+    if input.checks.len() == 1 {
+        let check = &input.checks[0];
+        let ty = &check.ty;
+        let inner = common::generate_unified_check(&check.expr, ty);
+
+        // Reference user's type before internal imports to avoid unused import warnings
+        quote::quote! {
+            {
+                fn __use_type<__T>(_: ::core::marker::PhantomData<__T>) {}
+                __use_type::<#ty>(::core::marker::PhantomData);
+                #inner
+            }
+        }
+    } else {
+        // Multiple checks - AND them together
+        let type_refs: Vec<_> = input.checks.iter()
+            .map(|c| {
+                let ty = &c.ty;
+                quote::quote! { __use_type::<#ty>(::core::marker::PhantomData); }
+            })
+            .collect();
+        let check_exprs: Vec<_> = input.checks.iter()
+            .map(|c| common::generate_unified_check(&c.expr, &c.ty))
+            .collect();
+
+        quote::quote! {
+            {
+                fn __use_type<__T>(_: ::core::marker::PhantomData<__T>) {}
+                #(#type_refs)*
+                (#(#check_exprs)&&*)
+            }
+        }
+    }
 }

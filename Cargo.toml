@@ -1,18 +1,29 @@
 [package]
 name = "tola-caps"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Capability system using 16-ary type-level trie with hash-stream routing"
+description = "Capability system enabling type-level state tracking, trait detection, and stable specialization."
 keywords = ["capability", "type-level", "compile-time", "zero-cost", "trie"]
 categories = ["rust-patterns", "no-std"]
 repository = "https://github.com/tola-rs/tola-caps"
 readme = "README.md"
 
 [features]
-default = []
+default = ["std", "specialize"]
+
+# Standard library support (includes alloc)
+std = ["alloc"]
+
+# Alloc library support (no_std compatible with allocator)
+alloc = []
+
+# Specialize macro support (requires detect for capability evaluation)
+specialize = ["detect"]
+
+# Std trait detection - independent feature
+detect = []
 
 [dependencies]
-tola-caps-macros = { path = "macros", version = "0.1.0" }
-
-# No other dependencies - pure type-level computation
+macros = { package = "tola-caps-macros", path = "macros", version = "0.2.0" }
+paste = "1.0"

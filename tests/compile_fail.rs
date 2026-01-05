@@ -1,6 +1,6 @@
 #![allow(dead_code, unused)]
 
-use tola_caps::prelude::*;
+use tola_caps::{prelude::*, with};
 use std::marker::PhantomData;
 
 struct Wrapper<C>(PhantomData<C>);
